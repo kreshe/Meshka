@@ -3,85 +3,545 @@
 # ================= НАСТРОЙКИ И БЕЗОПАСНОСТЬ =================
 set -Eeuo pipefail
 
-trap 'stty echo 2>/dev/null || true' EXIT
-
-APP_VERSION="2.4"
+APP_VERSION="2.7"
 APP_PATH="/usr/bin/me"
-STYLE_FILE="$HOME/.me_style" 
 
-MODE_FILE="$HOME/.meshka_mode"
+# ЕДИНЫЙ конфигурационный файл MESHKA.
+# В нём хранятся:
+#   MODE
+#   STYLE
+#   AUTO_LOGIN_ENABLED
+#   AUTO_LOGIN_COOLDOWN
+#   FLASH_RETRY_ENABLED
+#   FLASH_RETRY_COOLDOWN
+#   FLASH_RETRY_TRIGGER
+#   координаты/размеры всех UART-окон
+CFG_FILE="${CFG_FILE:-$HOME/.meshka.cfg}"
+
+LOGIN="${LOGIN:-root}"
+PASSWORD="${PASSWORD:-toor}"
+BAUDRATE="${BAUDRATE:-1500000}"
+PORT_GLOB="${PORT_GLOB:-/dev/ttyUSB*}"
+
+FS="/opt/test-soft/"
+INST="${INST:-custom-installer}"
+RUN="${RUN:-./run-tests.sh}"
+
+TS="/opt/test-soft/pytest_tests/"
+ST="${ST:-python3 -m pytest test_storage.py}"
+ETX_CMD="${ETX_CMD:-python3 -m pytest test_ethernet.py}"
+USB_CMD="${USB_CMD:-python3 -m pytest test_usb_flash.py}"
+GPI_CMD="${GPI_CMD:-python3 -m pytest test_gpio.py}"
+CPU_CMD="${CPU_CMD:-python3 -m pytest test_cpu.py}"
+MEM_CMD="${MEM_CMD:-python3 -m pytest test_memory.py}"
+
+DR="/opt/test-arlink"
+AR_CMD="${AR_CMD:-./test-arlink.sh}"
+ASD_CMD="${ASD_CMD:-dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=2000 status=progress oflag=direct}"
+
 MODE=""
 
-LOGIN="${LOGIN:-}" #Логин для UART/Login for UART
-PASSWORD="${PASSWORD:-}" #Пароль для UART/Password for UART
-BAUDRATE="${BAUDRATE:-}" #Скорось для  UART/Speed for UART
-
-PORT_GLOB="${PORT_GLOB:-/dev/ttyUSB*}" 
-
-FS="/opt/test-soft/" #Папка где расположены тесты на устройстве
-INST="${INST:-}" 
-RUN="${RUN:-}"
-
-TS="/opt/test-soft/pytest_tests/" #Прямая ссылка на тесты
-ST="${ST:-python3 -m pytest test_storage.py}"
-ETX="${ETX:-python3 -m pytest test_ethernet.py}"
-USB="${USB:-python3 -m pytest test_usb_flash.py}"
-GPI="${GPI:-python3 -m pytest test_gpio.py}"
-CPU="${CPU:-python3 -m pytest test_cpu.py}"
-MEM="${MEM:-python3 -m pytest test_memory.py}"
-
-DR="/"
-AR="${AR:-}"
-ASD="${ASD:-}"
-
-
-load_mode() {
-    if [[ -f "$MODE_FILE" && -s "$MODE_FILE" ]]; then
-        MODE=$(cat "$MODE_FILE")
+# ================= УЧЁТНЫЕ ДАННЫЕ ПО РЕЖИМУ =================
+get_mode_login() {
+    if [[ "$MODE" == "CPU" ]]; then
+        printf '%s' "root"
     else
-        MODE=""
+        printf '%s' "$LOGIN"
+    fi
+}
+
+get_mode_password() {
+    if [[ "$MODE" == "CPU" ]]; then
+        printf '%s' "zz12zz34"
+    else
+        printf '%s' "$PASSWORD"
+    fi
+}
+
+
+ME_STYLE="cyber"
+AUTO_LOGIN_ENABLED="1"
+AUTO_LOGIN_COOLDOWN="10"
+FLASH_RETRY_ENABLED="1"
+FLASH_RETRY_COOLDOWN="3"
+FLASH_RETRY_TRIGGER="zsh: no matches found:"
+POST_LOGIN_RETRY_ENABLED="1"
+POST_LOGIN_RETRY_COOLDOWN="5"
+POST_LOGIN_RETRY_TRIGGER="zsh: corrupt history file"
+
+# Дополнительные параметры State Machine для каждого UART.
+# Попытки ограничены, чтобы одна неисправная плата не зацикливала MESHKA.
+POST_LOGIN_RETRY_MAX="3"
+FLASH_RETRY_MAX="5"
+STATE_MACHINE_ENABLED="1"
+STATE_MACHINE_VERBOSE="1"
+
+# Защита единого CFG от параллельной записи.
+CFG_LOCK_FILE="${CFG_LOCK_FILE:-${CFG_FILE}.lock}"
+AUTO_LOGIN_LOG_DIR="${AUTO_LOGIN_LOG_DIR:-$HOME/.meshka_capture}"
+AUTO_LOGIN_VERBOSE="${AUTO_LOGIN_VERBOSE:-1}"
+
+WINDOW_GEOMETRY_INTERVAL="${WINDOW_GEOMETRY_INTERVAL:-2}"
+WINDOW_GEOMETRY_RESTORE_TRIES="${WINDOW_GEOMETRY_RESTORE_TRIES:-12}"
+WINDOW_GEOMETRY_RESTORE_DELAY="${WINDOW_GEOMETRY_RESTORE_DELAY:-0.25}"
+WINDOW_DEFAULT_X="${WINDOW_DEFAULT_X:-50}"
+WINDOW_DEFAULT_Y="${WINDOW_DEFAULT_Y:-50}"
+WINDOW_DEFAULT_WIDTH="${WINDOW_DEFAULT_WIDTH:-900}"
+WINDOW_DEFAULT_HEIGHT="${WINDOW_DEFAULT_HEIGHT:-500}"
+
+# ================= ЕДИНЫЙ CONFIG =================
+declare -A WINDOW_X=()
+# Координаты и размеры обязательно associative arrays.
+declare -A WINDOW_Y=()
+declare -A WINDOW_WIDTH=()
+declare -A WINDOW_HEIGHT=()
+
+load_config() {
+    [[ -f "$CFG_FILE" ]] || return 0
+
+    local key value a b c d label
+
+    while IFS='=' read -r key value; do
+        key="${key##+([[:space:]])}"
+        key="${key%%+([[:space:]])}"
+        value="${value#${value%%[![:space:]]*}}"
+        value="${value%${value##*[![:space:]]}}"
+
+        [[ -z "$key" ]] && continue
+        [[ "$key" == \#* ]] && continue
+
+        case "$key" in
+            MODE)
+                case "$value" in
+                    flash|check|check_SD|RFM|CPU) MODE="$value" ;;
+                esac
+                ;;
+            STYLE)
+                case "$value" in
+                    retro|icons|cyber|table) ME_STYLE="$value" ;;
+                esac
+                ;;
+            AUTO_LOGIN_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] && AUTO_LOGIN_ENABLED="$value"
+                ;;
+            AUTO_LOGIN_COOLDOWN)
+                [[ "$value" =~ ^[0-9]+$ ]] && AUTO_LOGIN_COOLDOWN="$value"
+                ;;
+            FLASH_RETRY_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] && FLASH_RETRY_ENABLED="$value"
+                ;;
+            FLASH_RETRY_COOLDOWN)
+                [[ "$value" =~ ^[0-9]+$ ]] && FLASH_RETRY_COOLDOWN="$value"
+                ;;
+            FLASH_RETRY_TRIGGER)
+                [[ -n "$value" ]] && FLASH_RETRY_TRIGGER="$value"
+                ;;
+            POST_LOGIN_RETRY_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] && POST_LOGIN_RETRY_ENABLED="$value"
+                ;;
+            POST_LOGIN_RETRY_COOLDOWN)
+                [[ "$value" =~ ^[0-9]+$ ]] && POST_LOGIN_RETRY_COOLDOWN="$value"
+                ;;
+            POST_LOGIN_RETRY_TRIGGER)
+                [[ -n "$value" ]] && POST_LOGIN_RETRY_TRIGGER="$value"
+                ;;
+            POST_LOGIN_RETRY_MAX)
+                [[ "$value" =~ ^[0-9]+$ ]] && POST_LOGIN_RETRY_MAX="$value"
+                ;;
+            FLASH_RETRY_MAX)
+                [[ "$value" =~ ^[0-9]+$ ]] && FLASH_RETRY_MAX="$value"
+                ;;
+            STATE_MACHINE_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] && STATE_MACHINE_ENABLED="$value"
+                ;;
+            STATE_MACHINE_VERBOSE)
+                [[ "$value" == 0 || "$value" == 1 ]] && STATE_MACHINE_VERBOSE="$value"
+                ;;
+            AUTO_LOGIN_LOG_DIR)
+                [[ -n "$value" ]] && AUTO_LOGIN_LOG_DIR="$value"
+                ;;
+            AUTO_LOGIN_VERBOSE)
+                [[ "$value" == 0 || "$value" == 1 ]] && AUTO_LOGIN_VERBOSE="$value"
+                ;;
+            WINDOW_*)
+                label="${key#WINDOW_}"
+                read -r a b c d <<< "$value"
+                [[ "$a" =~ ^-?[0-9]+$ ]] || continue
+                [[ "$b" =~ ^-?[0-9]+$ ]] || continue
+                [[ "$c" =~ ^[0-9]+$ ]] || continue
+                [[ "$d" =~ ^[0-9]+$ ]] || continue
+                WINDOW_X["$label"]="$a"
+                WINDOW_Y["$label"]="$b"
+                WINDOW_WIDTH["$label"]="$c"
+                WINDOW_HEIGHT["$label"]="$d"
+                ;;
+        esac
+    done < "$CFG_FILE"
+}
+
+save_config() {
+    mkdir -p "$(dirname "$CFG_FILE")"
+
+    local tmp="${CFG_FILE}.tmp.$$"
+    local label
+
+    # Один writer за раз. Любая старая версия CFG атомарно заменяется только
+    # после успешного формирования временного файла.
+    exec 9>"$CFG_LOCK_FILE"
+    if command -v flock >/dev/null 2>&1; then
+        flock -x 9
     fi
 
-    # защита от мусора
-    case "$MODE" in
-        flash|check|check_SD) ;;
-        *) MODE="" ;;
-    esac
-}
-save_mode() {
-    echo "$MODE" > "$MODE_FILE.tmp" && mv "$MODE_FILE.tmp" "$MODE_FILE"
+    {
+        printf '# MESHKA V%s configuration\n' "$APP_VERSION"
+        printf '# Один файл: режим, стиль, авто-логин и геометрия UART-окон.\n'
+        printf '# Формат окна: WINDOW_ttyUSB0=X Y WIDTH HEIGHT\n\n'
+
+        printf 'MODE=%s\n' "$MODE"
+        printf 'STYLE=%s\n' "$ME_STYLE"
+        printf 'AUTO_LOGIN_ENABLED=%s\n' "$AUTO_LOGIN_ENABLED"
+        printf 'AUTO_LOGIN_COOLDOWN=%s\n' "$AUTO_LOGIN_COOLDOWN"
+        printf 'FLASH_RETRY_ENABLED=%s\n' "$FLASH_RETRY_ENABLED"
+        printf 'FLASH_RETRY_COOLDOWN=%s\n' "$FLASH_RETRY_COOLDOWN"
+        printf 'FLASH_RETRY_TRIGGER=%s\n' "$FLASH_RETRY_TRIGGER"
+        printf 'FLASH_RETRY_MAX=%s\n' "$FLASH_RETRY_MAX"
+        printf 'POST_LOGIN_RETRY_ENABLED=%s\n' "$POST_LOGIN_RETRY_ENABLED"
+        printf 'POST_LOGIN_RETRY_COOLDOWN=%s\n' "$POST_LOGIN_RETRY_COOLDOWN"
+        printf 'POST_LOGIN_RETRY_TRIGGER=%s\n' "$POST_LOGIN_RETRY_TRIGGER"
+        printf 'POST_LOGIN_RETRY_MAX=%s\n' "$POST_LOGIN_RETRY_MAX"
+        printf 'STATE_MACHINE_ENABLED=%s\n' "$STATE_MACHINE_ENABLED"
+        printf 'STATE_MACHINE_VERBOSE=%s\n' "$STATE_MACHINE_VERBOSE"
+        printf 'AUTO_LOGIN_LOG_DIR=%s\n' "$AUTO_LOGIN_LOG_DIR"
+        printf 'AUTO_LOGIN_VERBOSE=%s\n' "$AUTO_LOGIN_VERBOSE"
+
+        printf '# UART WINDOWS\n'
+        if ((${#WINDOW_X[@]} > 0)); then
+            while IFS= read -r label; do
+                [[ -n "$label" ]] || continue
+                [[ -n "${WINDOW_X[$label]:-}" ]] || continue
+                [[ -n "${WINDOW_Y[$label]:-}" ]] || continue
+                [[ -n "${WINDOW_WIDTH[$label]:-}" ]] || continue
+                [[ -n "${WINDOW_HEIGHT[$label]:-}" ]] || continue
+                printf 'WINDOW_%s=%s %s %s %s\n' \
+                    "$label" \
+                    "${WINDOW_X[$label]}" \
+                    "${WINDOW_Y[$label]}" \
+                    "${WINDOW_WIDTH[$label]}" \
+                    "${WINDOW_HEIGHT[$label]}"
+            done < <(printf '%s\n' "${!WINDOW_X[@]}" | sort -V)
+        fi
+    } > "$tmp"
+
+    mv -f "$tmp" "$CFG_FILE"
+
+    if command -v flock >/dev/null 2>&1; then
+        flock -u 9
+    fi
+    exec 9>&-
 }
 
-shopt -s nullglob
 
-if [[ -n "${ME_PORTS:-}" ]]; then
-    # пример: export ME_PORTS="/dev/ttyUSB0 /dev/ttyUSB1"
-    read -r -a PORTS <<< "$ME_PORTS"
-else
-    PORTS=($PORT_GLOB)
+# ================= ТРАП =================
+trap 'stop_uart_monitors 2>/dev/null || true; stop_window_geometry_monitor 2>/dev/null || true; save_all_window_geometries 2>/dev/null || true; stty echo 2>/dev/null || true' EXIT
+
+# ================= АВТО-ЛОГИН ПО СЛОВАМ =================
+AUTO_LOGIN_TRIGGERS=(
+    "login:"
+    "username:"
+    "user name:"
+    "IPvgin:"
+)
+
+if [[ -n "${ME_AUTO_TRIGGERS:-}" ]]; then
+    IFS=';' read -r -a AUTO_LOGIN_TRIGGERS <<< "$ME_AUTO_TRIGGERS"
 fi
 
-ME_STYLE=$(cat "$STYLE_FILE" 2>/dev/null || echo "cyber")
-INPUT_HISTORY=()  # история введённых команд/клавиш (последние 6)
+MONITOR_PIDS=()
+WINDOW_GEOMETRY_MONITOR_PID=""
 
+# ================= ЗАГРУЗКА CONFIG =================
+shopt -s extglob nullglob
+load_config
+
+# Переменная окружения всегда имеет приоритет над cfg.
+if [[ -n "${AUTO_LOGIN_ENABLED_ENV:-}" ]]; then
+    AUTO_LOGIN_ENABLED="$AUTO_LOGIN_ENABLED_ENV"
+fi
+
+case "$AUTO_LOGIN_ENABLED" in
+    0|1) ;;
+    *) AUTO_LOGIN_ENABLED="1" ;;
+esac
+
+# ================= РАСПОЛОЖЕНИЕ ОКОН =================
+ensure_window_defaults() {
+    local PORT LABEL
+
+    for PORT in "${PORTS[@]}"; do
+        [[ -e "$PORT" ]] || continue
+        LABEL=$(basename "$PORT")
+
+        if [[ -z "${WINDOW_X[$LABEL]:-}" ]]; then
+            WINDOW_X["$LABEL"]="$WINDOW_DEFAULT_X"
+            WINDOW_Y["$LABEL"]="$WINDOW_DEFAULT_Y"
+            WINDOW_WIDTH["$LABEL"]="$WINDOW_DEFAULT_WIDTH"
+            WINDOW_HEIGHT["$LABEL"]="$WINDOW_DEFAULT_HEIGHT"
+        fi
+    done
+}
+
+find_uart_window() {
+    local label="$1"
+    local ids candidate name wid=""
+
+    command -v xdotool >/dev/null 2>&1 || return 1
+
+    ids=$(xdotool search --onlyvisible --name "$label" 2>/dev/null || true)
+
+    while read -r candidate; do
+        [[ -z "$candidate" ]] && continue
+        name=$(xdotool getwindowname "$candidate" 2>/dev/null || true)
+        if [[ "$name" == *"$label"* ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done <<< "$ids"
+
+    wid=$(xdotool search --name "$label" 2>/dev/null | head -n 1 || true)
+    [[ -n "$wid" ]] || return 1
+    printf '%s\n' "$wid"
+}
+
+read_window_geometry() {
+    local wid="$1"
+    xdotool getwindowgeometry --shell "$wid" 2>/dev/null || return 1
+}
+
+save_window_geometry() {
+    local label="$1"
+    local wid geom key value
+    local x="" y="" width="" height=""
+
+    wid=$(find_uart_window "$label" 2>/dev/null || true)
+    [[ -n "$wid" ]] || return 1
+
+    geom=$(read_window_geometry "$wid") || return 1
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            X) x="$value" ;;
+            Y) y="$value" ;;
+            WIDTH) width="$value" ;;
+            HEIGHT) height="$value" ;;
+        esac
+    done <<< "$geom"
+
+    [[ "$x" =~ ^-?[0-9]+$ ]] || return 1
+    [[ "$y" =~ ^-?[0-9]+$ ]] || return 1
+    [[ "$width" =~ ^[0-9]+$ ]] || return 1
+    [[ "$height" =~ ^[0-9]+$ ]] || return 1
+
+    WINDOW_X["$label"]="$x"
+    WINDOW_Y["$label"]="$y"
+    WINDOW_WIDTH["$label"]="$width"
+    WINDOW_HEIGHT["$label"]="$height"
+    return 0
+}
+
+save_all_window_geometries() {
+    command -v xdotool >/dev/null 2>&1 || return 0
+    [[ -f "$CFG_FILE" ]] || return 0
+
+    local PORT LABEL
+    local -A CURRENT=()
+
+    # Начинаем с последних известных координат, чтобы временно не найденное
+    # окно не исчезало из CFG. Свежая геометрия ниже просто перезаписывает её.
+    for LABEL in "${!WINDOW_X[@]}"; do
+        [[ -n "${WINDOW_Y[$LABEL]:-}" ]] || continue
+        [[ -n "${WINDOW_WIDTH[$LABEL]:-}" ]] || continue
+        [[ -n "${WINDOW_HEIGHT[$LABEL]:-}" ]] || continue
+        CURRENT["$LABEL"]="${WINDOW_X[$LABEL]} ${WINDOW_Y[$LABEL]} ${WINDOW_WIDTH[$LABEL]} ${WINDOW_HEIGHT[$LABEL]}"
+    done
+
+    for PORT in "${PORTS[@]}"; do
+        [[ -e "$PORT" ]] || continue
+        LABEL=$(basename "$PORT")
+
+        if save_window_geometry "$LABEL"; then
+            CURRENT["$LABEL"]="${WINDOW_X[$LABEL]} ${WINDOW_Y[$LABEL]} ${WINDOW_WIDTH[$LABEL]} ${WINDOW_HEIGHT[$LABEL]}"
+        fi
+    done
+
+    # КРИТИЧНО: здесь больше НЕ вызываем save_config().
+    # Фоновый monitor имеет собственную копию MODE/STYLE/AUTO_LOGIN и раньше
+    # мог откатить изменения главного процесса. Мы меняем только строки WINDOW_.
+    exec 9>"$CFG_LOCK_FILE"
+    if command -v flock >/dev/null 2>&1; then
+        flock -x 9
+    fi
+
+    local tmp="${CFG_FILE}.tmp.geom.$$"
+    awk '!/^WINDOW_[^=]+=/ && $0 != "# UART WINDOWS"' "$CFG_FILE" > "$tmp"
+
+    printf '\n# UART WINDOWS\n' >> "$tmp"
+    if ((${#CURRENT[@]} > 0)); then
+        while IFS= read -r LABEL; do
+            [[ -n "$LABEL" ]] || continue
+            printf 'WINDOW_%s=%s\n' "$LABEL" "${CURRENT[$LABEL]}" >> "$tmp"
+        done < <(printf '%s\n' "${!CURRENT[@]}" | sort -V)
+    else
+        # Если окно временно не найдено, сохраняем последние известные значения.
+        if ((${#WINDOW_X[@]} > 0)); then
+            while IFS= read -r LABEL; do
+                [[ -n "$LABEL" ]] || continue
+                [[ -n "${WINDOW_Y[$LABEL]:-}" ]] || continue
+                [[ -n "${WINDOW_WIDTH[$LABEL]:-}" ]] || continue
+                [[ -n "${WINDOW_HEIGHT[$LABEL]:-}" ]] || continue
+                printf 'WINDOW_%s=%s %s %s %s\n' \
+                    "$LABEL" \
+                    "${WINDOW_X[$LABEL]}" \
+                    "${WINDOW_Y[$LABEL]}" \
+                    "${WINDOW_WIDTH[$LABEL]}" \
+                    "${WINDOW_HEIGHT[$LABEL]}" >> "$tmp"
+            done < <(printf '%s\n' "${!WINDOW_X[@]}" | sort -V)
+        fi
+    fi
+
+    mv -f "$tmp" "$CFG_FILE"
+
+    flock -u 9
+    exec 9>&-
+}
+
+
+apply_window_geometry() {
+    local label="$1"
+    local wid=""
+
+    [[ -n "${WINDOW_X[$label]:-}" ]] || return 0
+    [[ -n "${WINDOW_Y[$label]:-}" ]] || return 0
+    [[ -n "${WINDOW_WIDTH[$label]:-}" ]] || return 0
+    [[ -n "${WINDOW_HEIGHT[$label]:-}" ]] || return 0
+
+    wid=$(find_uart_window "$label" 2>/dev/null || true)
+    [[ -n "$wid" ]] || return 0
+
+    xdotool windowsize "$wid" \
+        "${WINDOW_WIDTH[$label]}" \
+        "${WINDOW_HEIGHT[$label]}" 2>/dev/null || true
+
+    xdotool windowmove "$wid" \
+        "${WINDOW_X[$label]}" \
+        "${WINDOW_Y[$label]}" 2>/dev/null || true
+}
+
+restore_window_geometry() {
+    local label="$1"
+    local wid=""
+    local i
+
+    [[ -n "${WINDOW_X[$label]:-}" ]] || return 0
+    [[ -n "${WINDOW_Y[$label]:-}" ]] || return 0
+    [[ -n "${WINDOW_WIDTH[$label]:-}" ]] || return 0
+    [[ -n "${WINDOW_HEIGHT[$label]:-}" ]] || return 0
+
+    for ((i=1; i<=WINDOW_GEOMETRY_RESTORE_TRIES; i++)); do
+        wid=$(find_uart_window "$label" 2>/dev/null || true)
+        if [[ -n "$wid" ]]; then
+            xdotool windowsize "$wid" \
+                "${WINDOW_WIDTH[$label]}" \
+                "${WINDOW_HEIGHT[$label]}" 2>/dev/null || true
+            sleep 0.15
+            xdotool windowmove "$wid" \
+                "${WINDOW_X[$label]}" \
+                "${WINDOW_Y[$label]}" 2>/dev/null || true
+            sleep 0.15
+            xdotool windowsize "$wid" \
+                "${WINDOW_WIDTH[$label]}" \
+                "${WINDOW_HEIGHT[$label]}" 2>/dev/null || true
+            xdotool windowmove "$wid" \
+                "${WINDOW_X[$label]}" \
+                "${WINDOW_Y[$label]}" 2>/dev/null || true
+            return 0
+        fi
+        sleep "$WINDOW_GEOMETRY_RESTORE_DELAY"
+    done
+}
+
+restore_all_window_geometries() {
+    command -v xdotool >/dev/null 2>&1 || return 0
+
+    local PORT LABEL
+    for PORT in "${PORTS[@]}"; do
+        [[ -e "$PORT" ]] || continue
+        LABEL=$(basename "$PORT")
+        restore_window_geometry "$LABEL" &
+    done
+}
+
+window_geometry_monitor() {
+    while true; do
+        sleep "$WINDOW_GEOMETRY_INTERVAL"
+        save_all_window_geometries
+    done
+}
+
+start_window_geometry_monitor() {
+    command -v xdotool >/dev/null 2>&1 || return 0
+
+    stop_window_geometry_monitor
+    window_geometry_monitor >/dev/null 2>&1 &
+    WINDOW_GEOMETRY_MONITOR_PID="$!"
+}
+
+stop_window_geometry_monitor() {
+    [[ -n "${WINDOW_GEOMETRY_MONITOR_PID:-}" ]] || return 0
+
+    kill "$WINDOW_GEOMETRY_MONITOR_PID" 2>/dev/null || true
+    wait "$WINDOW_GEOMETRY_MONITOR_PID" 2>/dev/null || true
+    WINDOW_GEOMETRY_MONITOR_PID=""
+}
+
+# ================= PORTS =================
+if [[ -n "${ME_PORTS:-}" ]]; then
+    read -r -a PORTS <<< "$ME_PORTS"
+else
+    mapfile -t PORTS < <(
+        printf '%s\n' $PORT_GLOB |
+        sed '/^[[:space:]]*$/d' |
+        sort -V
+    )
+fi
+
+INPUT_HISTORY=()
 declare -A PORT_OLD_STATUS
 
 # ================= ЗАВИСИМОСТИ =================
-dependencies=(stty tr head minicom lsof)
+dependencies=(stty tr head minicom lsof tail xdotool flock sort sed)
 
 install_pkg() {
-    pkg="$1"
+    local pkg="$1"
+    local apt_pkg="$pkg"
 
     if command -v "$pkg" >/dev/null 2>&1; then
         return 0
     fi
 
-    echo "Пакет $pkg не найден. Пытаемся установить..."
+    case "$pkg" in
+        flock)
+            apt_pkg="util-linux"
+            ;;
+        stty|tr|head|tail)
+            apt_pkg="coreutils"
+            ;;
+    esac
+
+    echo "Пакет/команда $pkg не найден(а). Пытаемся установить $apt_pkg..."
 
     if command -v apt >/dev/null 2>&1; then
-        sudo apt update >/dev/null 2>&1
-        sudo apt install -y "$pkg"
-        sudo apt-get install dbus-x11
+        sudo apt update >/dev/null 2>&1 || true
+        sudo apt install -y "$apt_pkg"
     else
         echo "Менеджер пакетов не найден. Установите $pkg вручную."
         return 1
@@ -89,8 +549,24 @@ install_pkg() {
 }
 
 for dep in "${dependencies[@]}"; do
-    install_pkg "$dep" || echo "Не удалось установить $dep, некоторые функции могут не работать."
+    install_pkg "$dep" || echo "⚠ Не удалось установить $dep, некоторые функции могут не работать."
 done
+
+install_dbus_x11() {
+    if command -v dbus-launch >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "⚠ dbus-launch не найден, устанавливаю dbus-x11..."
+
+    if command -v apt >/dev/null 2>&1; then
+        sudo apt update >/dev/null 2>&1 || true
+        sudo apt install -y dbus-x11
+    else
+        echo "❌ Не удалось установить dbus-x11 автоматически"
+        return 1
+    fi
+}
 
 # ================= ЦВЕТА =================
 RED="\e[31m"
@@ -99,16 +575,14 @@ YELLOW="\e[33m"
 BLUE="\e[34m"
 CYAN="\e[36m"
 MAGENTA="\e[35m"
-RESET="\e[0m"  # <- вызвать автообновление до отрисовки UI
-
-
+RESET="\e[0m"
 
 # ================= АНИМАЦИИ =================
 anim_retro() {
     local msg="$1"
     local i
     for ((i=0; i<${#msg}; i++)); do
-        printf  ${GREEN}"%c"${RESET} "${msg:$i:1}"
+        printf "${GREEN}%c${RESET}" "${msg:$i:1}"
         sleep 0.03
     done
     echo
@@ -135,16 +609,7 @@ anim_progress() {
     printf "] ${GREEN}OK${RESET}\n"
 }
 
-anim_cyber() {
-    local i line
-    for i in {1..10}; do
-        line=$(tr -dc 'A-Za-z0-9@#$%&*' </dev/urandom | head -c 60)
-        echo -e "${MAGENTA}$line${RESET}"
-        sleep 0.05
-    done
-}
-
-# ================= UI СТИЛИ =================
+# ================= UI =================
 ui_retro() {
     clear
     anim_retro "@@@@@@@@@@@@@@@@@@@@@@@"
@@ -154,7 +619,7 @@ ui_retro() {
 }
 
 ui_icons() {
-    clear   
+    clear
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo -e " ℹ  MESHKA ${CYAN}V$APP_VERSION $MODE ${RESET}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -188,7 +653,6 @@ ui_cyber() {
     echo
 }
 
-# ================= СТАТУС ПОРТОВ =================
 get_port_status() {
     local port="$1"
     local info
@@ -220,7 +684,6 @@ animate_status_change() {
     local new_status="$3"
 
     [[ "$old_status" == "$new_status" ]] && return
-
     echo -e "${YELLOW}Статус порта ${port}: ${old_status} → ${new_status}${RESET}"
 }
 
@@ -269,9 +732,7 @@ draw_ports_status() {
     echo "└──────────┴───────────┴────────────┘"
 }
 
-# ================= ОТРИСОВКА UI =================
 draw_ui() {
-    
     case "$ME_STYLE" in
         retro)
             ui_retro
@@ -282,15 +743,27 @@ draw_ui() {
             draw_ports_status
             ;;
         cyber)
-            ui_cyber     # киберпанк рисует порты сам
+            ui_cyber
+            ;;
+        table)
+            clear
+            echo "╔══════════════════════════════════════╗"
+            echo "║         MESHKA V$APP_VERSION $MODE             ║"
+            echo "╚══════════════════════════════════════╝"
+            draw_ports_status
             ;;
         *)
-            ui_retro
-            draw_ports_status
+            ME_STYLE="cyber"
+            ui_cyber
             ;;
     esac
 
-    echo "👁️ Тесты: 1–13|r - автологин|0 - меню UI|h - команды|e - ENTER"
+    echo "👁️ Тесты: 1–13 | a - авто-логин ON/OFF | 0 - UI | h - команды | w - смена режима"
+    if [[ "$AUTO_LOGIN_ENABLED" == "1" ]]; then
+        echo "🤖 Авто-логин: ON | режим: $MODE"
+    else
+        echo "🤖 Авто-логин: OFF"
+    fi
     echo
 }
 
@@ -304,6 +777,7 @@ style_menu() {
     echo "1) Retro / DOS"
     echo "2) Компактные иконки"
     echo "3) Хакер / Киберпанк"
+    echo "4) Таблица"
     echo
     echo "0) Отмена"
     echo
@@ -315,60 +789,385 @@ style_menu() {
         1) ME_STYLE="retro" ;;
         2) ME_STYLE="icons" ;;
         3) ME_STYLE="cyber" ;;
+        4) ME_STYLE="table" ;;
         *) return ;;
     esac
 
-    echo "$ME_STYLE" > "$STYLE_FILE"
+    save_config
     draw_ui
 }
 
-# ================= АВТОЛОГИН =================
+# ================= UART STATE MACHINE =================
+# Каждый monitor_capture_file() работает со своей платой/UART и имеет
+# независимое состояние. Поэтому ошибка ttyUSB0 не меняет состояние ttyUSB1.
+#
+# Состояния:
+#   IDLE                - ничего не выполняется
+#   LOGIN_TRIGGERED     - найден login trigger
+#   PASSWORD_SENT       - пароль отправлен
+#   WAITING_SHELL       - ждём следующий shell/ошибку после авторизации
+#   MODE_RUNNING        - выполняется действие текущего MODE
+#   POST_LOGIN_RETRY    - повторяем PASSWORD -> MODE после ошибки history
+#   FLASH_RETRY         - повторяем INST после flash-ошибки
+#   DONE                - текущая последовательность завершена
+#   ERROR               - превышен лимит попыток
+
+uart_state_transition() {
+    local label="$1"
+    local state="$2"
+    local reason="${3:-}"
+
+    # Переменная UART_STATE находится в monitor_capture_file() и поэтому
+    # является независимым состоянием конкретного UART.
+    UART_STATE="$state"
+}
+
+uart_state_login_sequence() {
+    local PORT="$1"
+    local LABEL="$2"
+    local AUTH_LOGIN AUTH_PASSWORD
+
+    AUTH_LOGIN="$(get_mode_login)"
+    AUTH_PASSWORD="$(get_mode_password)"
+
+    uart_state_transition "$LABEL" "LOGIN_TRIGGERED" "login trigger"
+    prepare_uart "$PORT" || return 1
+
+    sleep 0.5
+    send_uart "$PORT" "$AUTH_LOGIN" || return 1
+    uart_state_transition "$LABEL" "LOGIN_SENT" "LOGIN sent"
+
+    sleep 3
+    send_uart "$PORT" "$AUTH_PASSWORD" || return 1
+    uart_state_transition "$LABEL" "PASSWORD_SENT" "PASSWORD sent"
+
+    uart_state_transition "$LABEL" "WAITING_SHELL" "waiting after authentication"
+    uart_state_transition "$LABEL" "MODE_RUNNING" "$(mode_action_name)"
+    run_mode_action "$PORT"
+    uart_state_transition "$LABEL" "DONE" "sequence complete"
+}
+
+uart_state_post_login_retry() {
+    local PORT="$1"
+    local LABEL="$2"
+    local attempt="$3"
+
+    uart_state_transition "$LABEL" "POST_LOGIN_RETRY" "attempt $attempt/$POST_LOGIN_RETRY_MAX"
+    retry_post_login_sequence "$PORT" || return 1
+    uart_state_transition "$LABEL" "DONE" "post-login retry complete"
+}
+
+uart_state_flash_retry() {
+    local PORT="$1"
+    local LABEL="$2"
+    local attempt="$3"
+
+    uart_state_transition "$LABEL" "FLASH_RETRY" "attempt $attempt/$FLASH_RETRY_MAX"
+    send_uart "$PORT" "$INST" || return 1
+    uart_state_transition "$LABEL" "MODE_RUNNING" "custom-installer retry"
+}
+
+# ================= UART / АВТО-ЛОГИН =================
+prepare_uart() {
+    local port="$1"
+    [[ -e "$port" ]] || return 1
+    stty -F "$port" "$BAUDRATE" raw -echo 2>/dev/null || true
+}
+
+send_uart() {
+    local port="$1"
+    local data="$2"
+
+    [[ -e "$port" ]] || return 1
+    printf '%s\r' "$data" > "$port"
+}
+
+mode_action_name() {
+    case "$MODE" in
+        flash)   echo "ПРОШИВКА" ;;
+        check)   echo "ТЕСТ RUN-TESTS (t → 1)" ;;
+        check_SD) echo "ПРОВЕРКА SD" ;;
+        RFM) echo "ПРОВЕРКА RFM" ;;
+        CPU) echo "ПРОВЕРКА CPU" ;;
+        *)       echo "ТОЛЬКО LOGIN/PASSWORD" ;;
+    esac
+}
+
+run_mode_action() {
+    local PORT="$1"
+
+    case "$MODE" in
+        flash)
+            sleep 0.5
+            send_uart "$PORT" "$INST"
+            ;;
+        check)
+            sleep 0.5
+            send_uart "$PORT" "t"
+            sleep 1
+            send_uart "$PORT" "1"
+            ;;
+        check_SD)
+            sleep 0.5
+            send_uart "$PORT" "dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=2000 status=progress oflag=direct"
+            ;;
+        RFM)
+            sleep 0.5
+            send_uart "$PORT" "t"
+            sleep 1
+            send_uart "$PORT" "12"
+            ;;
+        CPU)
+            sleep 0.5
+            send_uart "$PORT" "p"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# Повторная отправка ВСЕЙ последовательности после уже выполненного логина.
+# Логин (LOGIN) заново НЕ отправляем: повторяем именно то, что должно идти
+# после него — PASSWORD, затем действие текущего MODE.
+retry_post_login_sequence() {
+    local PORT="$1"
+    local AUTH_PASSWORD
+
+    AUTH_PASSWORD="$(get_mode_password)"
+
+    [[ -e "$PORT" ]] || return 1
+
+    prepare_uart "$PORT"
+
+    # Для CPU используется пароль zz12zz34,
+    # для остальных режимов — обычный PASSWORD.
+    sleep 0.5
+    send_uart "$PORT" "$AUTH_PASSWORD"
+    run_mode_action "$PORT"
+}
+
 auto_login() {
-    echo "🔊️ Выполняется автологин. Режим: $MODE"
+    echo "🔊️ Выполняется автологин. Режим: $MODE ($(mode_action_name))"
 
     local PORT
+
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
-            sleep 1
-            echo "$LOGIN"    > "$PORT"
-            sleep 3
-            echo "$PASSWORD" > "$PORT"
-            sleep 3
-            if [[ "$MODE" == "flash" ]]; then
-                echo "custom-installer" > "$PORT"
-            elif [[ "$MODE" == "check" ]]; then
-            echo "t" > "$PORT"
-                sleep 1
-                  echo "1" > "$PORT"
-            elif [[ "$MODE" == "check_SD" ]]; then
-            echo "dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=2000 status=progress oflag=direct" > "$PORT"
-                
-            fi
 
+            local AUTH_LOGIN AUTH_PASSWORD
+            AUTH_LOGIN="$(get_mode_login)"
+            AUTH_PASSWORD="$(get_mode_password)"
+
+            prepare_uart "$PORT"
+            sleep 1
+            send_uart "$PORT" "$AUTH_LOGIN"
+            sleep 3
+            send_uart "$PORT" "$AUTH_PASSWORD"
+            run_mode_action "$PORT"
         ) &
     done
-    wait
-    echo "🤖️ Автологин выполнен"
 }
 
 just_login() {
     echo "🔊️ Выполняется автологин..."
 
     local PORT
+
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+
+            local AUTH_LOGIN AUTH_PASSWORD
+            AUTH_LOGIN="$(get_mode_login)"
+            AUTH_PASSWORD="$(get_mode_password)"
+
+            prepare_uart "$PORT"
             sleep 1
-            echo "$LOGIN"    > "$PORT"
+            send_uart "$PORT" "$AUTH_LOGIN"
             sleep 3
-            echo "$PASSWORD" > "$PORT"
+            send_uart "$PORT" "$AUTH_PASSWORD"
         ) &
     done
-    wait
+
     echo "🤖️ Автологин выполнен"
+}
+
+monitor_capture_file() {
+    local PORT="$1"
+    local LABEL LOGFILE BUFFER="" CH trigger lower
+    local last_trigger_time=0
+    local last_flash_retry_time=0
+    local last_post_login_retry_time=0
+    local post_login_retry_count=0
+    local flash_retry_count=0
+    local now
+
+    # ВАЖНО: эти переменные принадлежат только конкретному UART-процессу.
+    # ttyUSB0 и ttyUSB1 никогда не используют общий state/counter.
+    local UART_STATE="IDLE"
+
+    LABEL=$(basename "$PORT")
+    LOGFILE="$AUTO_LOGIN_LOG_DIR/${LABEL}.log"
+
+    mkdir -p "$AUTO_LOGIN_LOG_DIR"
+    touch "$LOGFILE"
+
+    uart_state_transition "$LABEL" "$UART_STATE" "monitor started"
+
+    while IFS= read -r -N 1 CH; do
+        BUFFER+="$CH"
+
+        if ((${#BUFFER} > 256)); then
+            BUFFER="${BUFFER: -256}"
+        fi
+
+        lower="${BUFFER,,}"
+
+        # --------------------------------------------------------------
+        # POST-LOGIN RETRY
+        # zsh: corrupt history file
+        # Повторяем именно PASSWORD -> MODE, без повторной отправки LOGIN.
+        # --------------------------------------------------------------
+        if [[ "$POST_LOGIN_RETRY_ENABLED" == "1" ]]; then
+            local post_login_trigger="${POST_LOGIN_RETRY_TRIGGER,,}"
+
+            if [[ -n "$post_login_trigger" && "$lower" == *"$post_login_trigger"* ]]; then
+                now=$(date +%s)
+
+                if (( now - last_post_login_retry_time >= POST_LOGIN_RETRY_COOLDOWN )); then
+                    if (( post_login_retry_count < POST_LOGIN_RETRY_MAX )); then
+                        post_login_retry_count=$((post_login_retry_count + 1))
+                        if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
+                            uart_state_transition "$LABEL" "WAITING_SHELL" "history corruption detected"
+                            uart_state_post_login_retry "$PORT" "$LABEL" "$post_login_retry_count" || true
+                        else
+                            retry_post_login_sequence "$PORT" || true
+                        fi
+                    else
+                        UART_STATE="ERROR"
+                        uart_state_transition "$LABEL" "ERROR" "POST_LOGIN_RETRY_MAX reached"
+                    fi
+                    last_post_login_retry_time=$now
+                fi
+
+                BUFFER=""
+                continue
+            fi
+        fi
+
+        # --------------------------------------------------------------
+        # FLASH RETRY
+        # --------------------------------------------------------------
+        if [[ "$MODE" == "flash" && "$FLASH_RETRY_ENABLED" == "1" ]]; then
+            local retry_trigger="${FLASH_RETRY_TRIGGER,,}"
+
+            if [[ -n "$retry_trigger" && "$lower" == *"$retry_trigger"* ]]; then
+                now=$(date +%s)
+
+                if (( now - last_flash_retry_time >= FLASH_RETRY_COOLDOWN )); then
+                    if (( flash_retry_count < FLASH_RETRY_MAX )); then
+                        flash_retry_count=$((flash_retry_count + 1))
+                        if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
+                            uart_state_flash_retry "$PORT" "$LABEL" "$flash_retry_count" || true
+                        else
+                            send_uart "$PORT" "$INST" || true
+                        fi
+                    else
+                        UART_STATE="ERROR"
+                        uart_state_transition "$LABEL" "ERROR" "FLASH_RETRY_MAX reached"
+                    fi
+                    last_flash_retry_time=$now
+                fi
+
+                BUFFER=""
+                continue
+            fi
+        fi
+
+        # --------------------------------------------------------------
+        # AUTO LOGIN TRIGGERS
+        # --------------------------------------------------------------
+        for trigger in "${AUTO_LOGIN_TRIGGERS[@]}"; do
+            trigger="${trigger,,}"
+            [[ -z "$trigger" ]] && continue
+
+            if [[ "$lower" == *"$trigger"* ]]; then
+                now=$(date +%s)
+
+                if (( now - last_trigger_time >= AUTO_LOGIN_COOLDOWN )); then
+                    if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
+                        UART_STATE="LOGIN_TRIGGERED"
+                        uart_state_login_sequence "$PORT" "$LABEL" || true
+                        UART_STATE="DONE"
+                    else
+                        auto_login_port "$PORT" || true
+                    fi
+                    last_trigger_time=$now
+                    post_login_retry_count=0
+                    flash_retry_count=0
+                fi
+
+                BUFFER=""
+                break
+            fi
+        done
+    done < <(tail -Fn 0 "$LOGFILE" 2>/dev/null || true)
+}
+
+
+start_uart_monitors() {
+    [[ "$AUTO_LOGIN_ENABLED" == "1" ]] || return 0
+
+    stop_uart_monitors
+    mkdir -p "$AUTO_LOGIN_LOG_DIR"
+
+    local PORT LABEL LOGFILE
+    for PORT in "${PORTS[@]}"; do
+        [[ -e "$PORT" ]] || continue
+
+        LABEL=$(basename "$PORT")
+        LOGFILE="$AUTO_LOGIN_LOG_DIR/${LABEL}.log"
+        touch "$LOGFILE"
+
+        monitor_capture_file "$PORT" &
+        MONITOR_PIDS+=("$!")
+    done
+}
+
+stop_uart_monitors() {
+    local pid
+
+    if ((${#MONITOR_PIDS[@]} == 0)); then
+        return 0
+    fi
+
+    for pid in "${MONITOR_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    MONITOR_PIDS=()
+}
+
+toggle_auto_login() {
+    if [[ "$AUTO_LOGIN_ENABLED" == "1" ]]; then
+        AUTO_LOGIN_ENABLED="0"
+        stop_uart_monitors
+        echo -e "${RED}🤖 Авто-логин по словам: ВЫКЛ${RESET}"
+    else
+        AUTO_LOGIN_ENABLED="1"
+        start_uart_monitors
+        echo -e "${GREEN}🤖 Авто-логин по словам: ВКЛ${RESET}"
+    fi
+
+    save_config
+
+    echo "  Режим: $MODE → $(mode_action_name)"
+    echo "  Триггеры: ${AUTO_LOGIN_TRIGGERS[*]}"
+    echo "  Cooldown: ${AUTO_LOGIN_COOLDOWN} сек."
+    sleep 0.8
+    draw_ui
 }
 
 stels_login() {
@@ -378,25 +1177,21 @@ stels_login() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$LOGIN"    > "$PORT"
+            send_uart "$PORT" "$LOGIN"
             sleep 3
-            echo "$PASSWORD" > "$PORT"
+            send_uart "$PORT" "$PASSWORD"
             sleep 1
-            echo "cd $FS" > "$PORT"
+            send_uart "$PORT" "cd $FS"
             sleep 1
-            echo "cd pytest_tests" > "$PORT"
+            send_uart "$PORT" "cd pytest_tests"
             sleep 1
-            echo "$ETX" > "$PORT"
+            send_uart "$PORT" "$ETX_CMD"
             sleep 1
-            echo "cd ~/" > "$PORT"
-     #       echo -ne '\r'    > "$PORT"   #ENTER
-     #       echo -ne '\x03'  > "$PORT"  #CTRL+C
-
+            send_uart "$PORT" "cd ~/"
         ) &
     done
-    wait
 }
 
 jiga_login() {
@@ -406,19 +1201,16 @@ jiga_login() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$LOGIN"    > "$PORT"
+            send_uart "$PORT" "$LOGIN"
             sleep 3
-            echo "$PASSWORD" > "$PORT"
+            send_uart "$PORT" "$PASSWORD"
             sleep 1
-            echo "journalctl -u mercury-run-tests.service -f -o cat | sed 's/^[[:space:]]*//'
-" > "$PORT"
+            send_uart "$PORT" "journalctl -u mercury-run-tests.service -f -o cat | sed 's/^[[:space:]]*//'"
         ) &
     done
-    wait
 }
-
 
 inst() {
     echo "🔊️ Зашиваемся по крупному"
@@ -427,12 +1219,11 @@ inst() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$INST"    > "$PORT"
+            send_uart "$PORT" "$INST"
         ) &
     done
-    wait
 }
 
 run() {
@@ -442,29 +1233,27 @@ run() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$FS" > "$PORT"
-            echo "$RUN" > "$PORT"
+            send_uart "$PORT" "$FS"
+            send_uart "$PORT" "$RUN"
         ) &
     done
-    wait
 }
 
 storage() {
-    echo "🔊️ Запуск проверки качеста прона"
+    echo "🔊️ Запуск проверки качества прон"
 
     local PORT
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$TS" > "$PORT"
-            echo "$ST" > "$PORT"
+            send_uart "$PORT" "$TS"
+            send_uart "$PORT" "$ST"
         ) &
     done
-    wait
 }
 
 ETX() {
@@ -474,14 +1263,13 @@ ETX() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$TS" > "$PORT"
-            echo "$ETX" > "$PORT"
-            echo "sudo ethtool eth0 | grep Speed" > "$PORT"
+            send_uart "$PORT" "$TS"
+            send_uart "$PORT" "$ETX_CMD"
+            send_uart "$PORT" "sudo ethtool eth0 | grep Speed"
         ) &
     done
-    wait
 }
 
 USB() {
@@ -491,13 +1279,12 @@ USB() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$TS" > "$PORT"
-            echo "$USB" > "$PORT"
+            send_uart "$PORT" "$TS"
+            send_uart "$PORT" "$USB_CMD"
         ) &
     done
-    wait
 }
 
 GPI() {
@@ -507,13 +1294,12 @@ GPI() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$TS" > "$PORT"
-            echo "$GPI" > "$PORT"
+            send_uart "$PORT" "$TS"
+            send_uart "$PORT" "$GPI_CMD"
         ) &
     done
-    wait
 }
 
 CPU() {
@@ -523,13 +1309,12 @@ CPU() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$TS" > "$PORT"
-            echo "$CPU" > "$PORT"
+            send_uart "$PORT" "$TS"
+            send_uart "$PORT" "$CPU_CMD"
         ) &
     done
-    wait
 }
 
 MEM() {
@@ -539,13 +1324,12 @@ MEM() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$TS" > "$PORT"
-            echo "$MEM" > "$PORT"
+            send_uart "$PORT" "$TS"
+            send_uart "$PORT" "$MEM_CMD"
         ) &
     done
-    wait
 }
 
 AR() {
@@ -555,13 +1339,12 @@ AR() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "cd $DR" > "$PORT"
-            echo "$AR" > "$PORT"
+            send_uart "$PORT" "cd $DR"
+            send_uart "$PORT" "$AR_CMD"
         ) &
     done
-    wait
 }
 
 ASD() {
@@ -571,13 +1354,13 @@ ASD() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "cd $DR" > "$PORT"
-            echo "$ASD" > "$PORT"
+            send_uart "$PORT" "cd $DR"
+            sleep 2
+            send_uart "$PORT" "$ASD_CMD"
         ) &
     done
-    wait
 }
 
 stress_login() {
@@ -587,35 +1370,15 @@ stress_login() {
     for PORT in "${PORTS[@]}"; do
         (
             [[ -e "$PORT" ]] || exit 0
-            stty -F "$PORT" "$BAUDRATE" raw -echo 2>/dev/null || true
+            prepare_uart "$PORT"
             sleep 1
-            echo "$LOGIN"    > "$PORT"
+            send_uart "$PORT" "$LOGIN"
             sleep 3
-            echo "$PASSWORD" > "$PORT"
+            send_uart "$PORT" "$PASSWORD"
             sleep 1
-            echo "stress-ng --cpu 0 --timeout 2m" > "$PORT"
+            send_uart "$PORT" "stress-ng --cpu 0 --timeout 2m"
         ) &
     done
-    wait
-}
-
-
-
-# ================= dbus-x11 (для gnome-terminal) =================
-install_dbus_x11() {
-    if command -v dbus-launch >/dev/null 2>&1; then
-        return 0
-    fi
-
-    echo "⚠ dbus-launch не найден, устанавливаю dbus-x11..."
-
-    if command -v apt >/dev/null 2>&1; then
-        sudo apt update
-        sudo apt install -y dbus-x11
-    else
-        echo "❌ Не удалось установить dbus-x11 автоматически"
-        return 1
-    fi
 }
 
 # ================= ОТКРЫТИЕ MINICOM =================
@@ -635,13 +1398,18 @@ open_minicom_terminals() {
         return 1
     fi
 
-    # если нет портов — просто сообщаем
     if ((${#PORTS[@]} == 0)); then
         echo "⚠ Порты ${PORT_GLOB} не найдены."
         return 0
     fi
 
-    local PORT LABEL STATUS
+    mkdir -p "$AUTO_LOGIN_LOG_DIR"
+    ensure_window_defaults
+
+    # Сохраняем cfg сразу после создания defaults.
+    save_config
+
+    local PORT LABEL STATUS LOGFILE PORT_Q BAUD_Q LOG_Q
 
     for PORT in "${PORTS[@]}"; do
         [[ -e "$PORT" ]] || continue
@@ -650,18 +1418,32 @@ open_minicom_terminals() {
         STATUS=$(get_port_status "$PORT")
 
         if [[ "$STATUS" == BUSY:* ]]; then
-            echo "⚠ $LABEL занят (${STATUS#BUSY:})"
+            echo "⚠ $LABEL занят (${STATUS#BUSY:}) — окно не открывается"
+            continue
+        fi
+
+        if [[ "$STATUS" == MINICOM ]]; then
+            echo "⚠ $LABEL уже открыт в minicom — окно не открывается"
             continue
         fi
 
         if [[ ! -r "$PORT" || ! -w "$PORT" ]]; then
-            echo "⚠ $LABEL — нет прав доступа"
+            echo "⚠ $LABEL — нет прав доступа — окно не открывается"
             continue
         fi
 
+        LOGFILE="$AUTO_LOGIN_LOG_DIR/${LABEL}.log"
+        : > "$LOGFILE"
+
+        printf -v PORT_Q '%q' "$PORT"
+        printf -v BAUD_Q '%q' "$BAUDRATE"
+        printf -v LOG_Q '%q' "$LOGFILE"
+
         if [[ "$term_type" == "gnome" ]] && ! command -v dbus-launch >/dev/null 2>&1; then
-            echo "⚠ $LABEL — dbus недоступен"
-            continue
+            install_dbus_x11 || {
+                echo "⚠ $LABEL — dbus недоступен — окно не открывается"
+                continue
+            }
         fi
 
         echo "😘️ Открываю minicom для $LABEL"
@@ -669,47 +1451,105 @@ open_minicom_terminals() {
         case "$term_type" in
             gnome)
                 gnome-terminal \
-                    --geometry=70x24 \
+                    --geometry=66x20 \
                     --title="$LABEL" \
                     -- bash -c "
                         echo 'minicom → $PORT';
-                        exec minicom -D '$PORT' -b '$BAUDRATE'
+                        echo 'capture → $LOGFILE';
+                        echo;
+                        TERM=xterm-256color minicom -D $PORT_Q -b $BAUD_Q -c on -a on -C $LOG_Q;
+                        RC=\$?;
+                        if [[ \$RC -ne 0 ]]; then
+                            echo;
+                            echo '========================================';
+                            echo '❌ Не удалось открыть UART: $PORT';
+                            echo \"❌ minicom завершился с кодом: \$RC\";
+                            echo '========================================';
+                            echo;
+                            echo 'Окно оставлено открытым для диагностики.';
+                            echo 'Нажмите ENTER для закрытия.';
+                            read -r;
+                        fi
+                        exit \$RC
                     " &
                 ;;
             konsole)
                 konsole \
-                    --geometry 70x24 \
+                    --geometry 80x24 \
                     --new-tab \
                     -p tabtitle="$LABEL" \
                     -e bash -c "
                         echo 'minicom → $PORT';
-                        exec minicom -D '$PORT' -b '$BAUDRATE'
+                        echo 'capture → $LOGFILE';
+                        echo;
+                        TERM=xterm-256color minicom -D $PORT_Q -b $BAUD_Q -c on -a on -C $LOG_Q;
+                        RC=\$?;
+                        if [[ \$RC -ne 0 ]]; then
+                            echo;
+                            echo '========================================';
+                            echo '❌ Не удалось открыть UART: $PORT';
+                            echo \"❌ minicom завершился с кодом: \$RC\";
+                            echo '========================================';
+                            echo 'Окно оставлено открытым для диагностики.';
+                            echo 'Нажмите ENTER для закрытия.';
+                            read -r;
+                        fi
+                        exit \$RC
                     " &
                 ;;
             xfce)
                 xfce4-terminal \
-                    --geometry=70x24 \
+                    --geometry=66x24 \
                     --title="$LABEL" \
                     -e bash -c "
                         echo 'minicom → $PORT';
-                        exec minicom -D '$PORT' -b '$BAUDRATE'
+                        echo 'capture → $LOGFILE';
+                        echo;
+                        TERM=xterm-256color minicom -D $PORT_Q -b $BAUD_Q -c on -a on -C $LOG_Q;
+                        RC=\$?;
+                        if [[ \$RC -ne 0 ]]; then
+                            echo;
+                            echo '========================================';
+                            echo '❌ Не удалось открыть UART: $PORT';
+                            echo \"❌ minicom завершился с кодом: \$RC\";
+                            echo '========================================';
+                            echo 'Окно оставлено открытым для диагностики.';
+                            echo 'Нажмите ENTER для закрытия.';
+                            read -r;
+                        fi
+                        exit \$RC
                     " &
                 ;;
             xterm)
                 xterm \
-                    -geometry 70x24 \
+                    -geometry 66x20 \
                     -T "$LABEL" \
                     -e bash -c "
                         echo 'minicom → $PORT';
-                        exec minicom -D '$PORT' -b '$BAUDRATE'
+                        echo 'capture → $LOGFILE';
+                        echo;
+                        TERM=xterm-256color minicom -D $PORT_Q -b $BAUD_Q -c on -a on -C $LOG_Q;
+                        RC=\$?;
+                        if [[ \$RC -ne 0 ]]; then
+                            echo;
+                            echo '========================================';
+                            echo '❌ Не удалось открыть UART: $PORT';
+                            echo \"❌ minicom завершился с кодом: \$RC\";
+                            echo '========================================';
+                            echo 'Окно оставлено открытым для диагностики.';
+                            echo 'Нажмите ENTER для закрытия.';
+                            read -r;
+                        fi
+                        exit \$RC
                     " &
                 ;;
         esac
 
-        sleep 0.2
+        sleep 0.3
     done
 
-    echo "⌨️  Вводите: "
+    echo "⌨️  Вводите:"
+    restore_all_window_geometries
 }
 
 # ================= СПРАВКА =================
@@ -717,8 +1557,9 @@ show_help() {
     echo
     echo "Доступные команды:"
     echo "  1–13   - отправка соответствующей команды на все доступные порты"
-    echo "  r      - автологин (LOGIN/PASSWORD)"
-    echo "  l      - автологин (LOGIN/PASSWORD/t)"
+    echo "  r      - ручной автологин (LOGIN/PASSWORD)"
+    echo "  a      - включить/выключить авто-логин по словам"
+    echo "  l      - автологин (LOGIN/PASSWORD + действие режима)"
     echo "  j      - автологин для джиги"
     echo "  u      - перезапуск UART портов"
     echo "  p      - Запуск прошивки"
@@ -729,21 +1570,23 @@ show_help() {
     echo "  g      - Запуск GPIO"
     echo "  v      - Запуск CPU"
     echo "  m      - Запуск Memory"
-    echo "  q      - Запуск "
+    echo "  q      - Запуск ARlink"
     echo "  e      - ENTER"
-    echo "  c      - вывод результатов всех тест"
-    echo "  w      - смена режима (Прошивка/Проверка)"
+    echo "  c      - отправка c на устройство"
+    echo "  w      - смена режима (Прошивка/Проверка/SD/RFM)"
     echo "  n      - автологин с запуском стресс теста на 2 минуты"
     echo "  0      - меню выбора стиля UI"
-    echo "  asd    - автологин (LOGIN/PASSWORD/auto_sd.sh)"
-    echo
+    echo "  h      - эта справка"
+    echo "  asd    - автологин + auto_sd.sh"
 }
 
 reset_uart_ports() {
-
     echo "🔄 Перезапуск UART терминалов..."
 
-    # закрываем только наши minicom
+    stop_uart_monitors
+    stop_window_geometry_monitor
+    save_all_window_geometries
+
     for PORT in "${PORTS[@]}"; do
         pkill -f "minicom -D $PORT" 2>/dev/null || true
     done
@@ -752,29 +1595,34 @@ reset_uart_ports() {
 
     echo "🔎 Пересканирование UART..."
 
-    # пересканировать устройства
     sudo udevadm trigger >/dev/null 2>&1 || true
     sudo udevadm settle >/dev/null 2>&1 || true
 
     sleep 1
 
-    # обновить список портов
-    PORTS=($PORT_GLOB)
+    mapfile -t PORTS < <(
+        printf '%s\n' $PORT_GLOB |
+        sed '/^[[:space:]]*$/d' |
+        sort -V
+    )
 
     if ((${#PORTS[@]} == 0)); then
         echo "⚠ UART устройства не найдены"
-        return
+        return 0
     fi
 
     echo "✔ Найдено ${#PORTS[@]} UART"
 
+    ensure_window_defaults
+    save_config
     draw_ui
     open_minicom_terminals
+    sleep 1
+    start_uart_monitors
+    start_window_geometry_monitor
 }
 
 # ================= РЕЖИМ РАБОТЫ =================
-load_mode
-
 if [[ -z "$MODE" ]]; then
     echo "=================================="
     echo "      ВЫБЕРИ РЕЖИМ (первый запуск)"
@@ -782,25 +1630,36 @@ if [[ -z "$MODE" ]]; then
     echo "1) Прошивать"
     echo "2) Проверять"
     echo "3) Проверка SD"
+    echo "4) RFM"
+    echo "5) CPU"
     echo
 
     while true; do
         read -rsn1 CH
-
         case "$CH" in
             1)
                 MODE="flash"
-                save_mode
+                save_config
                 break
                 ;;
             2)
                 MODE="check"
-                save_mode
+                save_config
                 break
                 ;;
             3)
                 MODE="check_SD"
-                save_mode
+                save_config
+                break
+                ;;
+            4)
+                MODE="RFM"
+                save_config
+                break
+                ;;
+            5) 
+                MODE="CPU"
+                save_config
                 break
                 ;;
         esac
@@ -811,6 +1670,7 @@ else
     echo "💿️  Загружен режим : $MODE"
     echo "✈️   Запускаем прогрев турбин"
 fi
+
 change_mode() {
     clear
     echo "========================"
@@ -819,6 +1679,8 @@ change_mode() {
     echo "1) Прошивать"
     echo "2) Проверять"
     echo "3) Проверка SD"
+    echo "4) RFM"
+    echo "5) CPU"
     echo "0) Отмена"
     echo
 
@@ -827,43 +1689,60 @@ change_mode() {
     case "$CH" in
         1)
             MODE="flash"
-            save_mode
             echo "✔ режим: Прошивка"
             ;;
         2)
             MODE="check"
-            save_mode
             echo "✔ режим: Проверка"
             ;;
         3)
             MODE="check_SD"
-            save_mode
             echo "✔ режим: Проверка_SD"
+            ;;
+        4)
+            MODE="RFM"
+            echo "✔ режим: RFM"
+            ;;
+        5)
+            MODE="CPU"
+            echo "✔ режим: CPU"
             ;;
         *)
             echo "отмена"
             ;;
     esac
+
+    save_config
+
+    if [[ "$AUTO_LOGIN_ENABLED" == "1" ]]; then
+        stop_uart_monitors
+        start_uart_monitors
+    fi
+
     draw_ui
 }
-#================= MAIN =================
-draw_ui >/dev/null
-open_minicom_terminals >/dev/null
+
+# ================= MAIN =================
+ensure_window_defaults
+save_config
+
 draw_ui
 open_minicom_terminals
-#auto_login
+
+sleep 1
+start_uart_monitors
+start_window_geometry_monitor
 
 while true; do
     CH=""
     if ! IFS= read -r CH; then
         if [[ -z "$CH" ]]; then
-        CH="ENTER"
+            CH="ENTER"
         fi
         break
     fi
 
-    if [[ "$CH" =~ ^(1[0-2]|[1-9]|13|r|q|Q|0|c|C|w|W|u|U|e|E|j|J|t|T|h|H|n|N|s|S|g|G|v|V|x|X|m|M|z|Z|q|Q|y|Y|l|L|к|К|д|Д|p|P|з|З|н|Н|й|Й|с|С|г|Г|е|Е|р|Р|ы|Ы|я|Я|у|У|ч|Ч|п|П|м|М|ь|Ь|ц|Ц|й|Й|о|О|т|Т|asd|фыв)$ ]]; then
-        # история только для команд управления устройством
+    if [[ "$CH" =~ ^(1[0-2]|[1-9]|13|r|q|Q|a|A|ф|Ф|0|c|C|w|W|u|U|e|E|j|J|t|T|h|H|n|N|s|S|g|G|v|V|x|X|m|M|z|Z|y|Y|l|L|к|К|д|Д|p|P|з|З|н|Н|й|Й|с|С|г|Г|е|Е|р|Р|ы|Ы|я|Я|у|У|ч|Ч|п|П|м|М|ь|Ь|ц|Ц|о|О|т|Т|asd|ASD|фыв|ФЫВ)$ ]]; then
         if [[ "$CH" =~ [123456789rRкКсСcC0] ]]; then
             INPUT_HISTORY+=("$CH")
             if ((${#INPUT_HISTORY[@]} > 6)); then
@@ -872,29 +1751,31 @@ while true; do
         fi
 
         if [[ "$ME_STYLE" == "table" ]]; then
-            ui_table
+            draw_ui
         else
             echo "👉️ Введено: $CH"
         fi
 
         case "$CH" in
-            1|2|3|4|5|6|7|8|9|10|11|12|13|c|с)
+            1|2|3|4|5|6|7|8|9|10|11|12|13|c|C|с|С)
                 for PORT in "${PORTS[@]}"; do
                     [[ -e "$PORT" ]] && printf "%s\r" "$CH" > "$PORT" &
                 done
-                wait
                 ;;
             l|L|д|Д)
                 auto_login
                 ;;
             r|R|к|К)
-               just_login
+                just_login
                 ;;
             asd|ASD|фыв|ФЫВ)
-               ASD
+                ASD
                 ;;
             y|Y|н|Н)
-               stels_login
+                stels_login
+                ;;
+            a|A|ф|Ф)
+                toggle_auto_login
                 ;;
             0)
                 style_menu
@@ -902,53 +1783,50 @@ while true; do
             e|E|у|У)
                 for PORT in "${PORTS[@]}"; do
                     [[ -e "$PORT" ]] && printf "\r" > "$PORT" &
-               done 
-               wait
-               ;;
+                done
+                ;;
             u|U|г|Г)
                 reset_uart_ports
-              ;;
+                ;;
             p|P|з|З)
-               inst
-              ;;
+                inst
+                ;;
             t|T|е|Е)
-               run
-              ;; 
+                run
+                ;;
             h|H|р|Р)
-               show_help
-              ;;    
+                show_help
+                ;;
             s|S|ы|Ы)
-               storage
-              ;;   
+                storage
+                ;;
             z|Z|я|Я)
-               ETX
-              ;;
+                ETX
+                ;;
             x|X|ч|Ч)
-               USB
-              ;; 
+                USB
+                ;;
             g|G|п|П)
-               GPI
-              ;;
+                GPI
+                ;;
             v|V|м|М)
-               CPU
-              ;;  
+                CPU
+                ;;
             m|M|ь|Ь)
-               MEM
-              ;;   
+                MEM
+                ;;
             q|Q|й|Й)
-               AR
-              ;;
+                AR
+                ;;
             ц|Ц|w|W)
-              change_mode
-              ;;
+                change_mode
+                ;;
             j|J|о|О)
-              jiga_login
-              ;;
+                jiga_login
+                ;;
             n|N|т|Т)
-              stress_login
-              ;;
+                stress_login
+                ;;
         esac
     fi
 done
-
-#|a|A|ф|Ф|
