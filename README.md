@@ -1,6 +1,6 @@
 # MESHKA (me)
 
-![Version](https://img.shields.io/badge/version-2.4-blue)
+![Version](https://img.shields.io/badge/version-2.7-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-green)
 ![Shell](https://img.shields.io/badge/script-Bash-orange)
 
