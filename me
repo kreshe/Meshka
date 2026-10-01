@@ -3,7 +3,7 @@
 # ================= НАСТРОЙКИ И БЕЗОПАСНОСТЬ =================
 set -Eeuo pipefail
 
-APP_VERSION="2.7"
+APP_VERSION="2.7.1"
 APP_PATH="/usr/bin/me"
 
 # ЕДИНЫЙ конфигурационный файл MESHKA.
@@ -252,8 +252,42 @@ AUTO_LOGIN_TRIGGERS=(
     "IPvgin:"
 )
 
+# Отдельные массивы триггеров для State Machine.
+# Каждый элемент проверяется как подстрока, поэтому после триггера
+# могут находиться дополнительные символы/текст.
+FLASH_RETRY_TRIGGERS=(
+    "zsh: no matches found:"
+    "cqstom-installes"
+    "custom-installus"
+    "c<ffffffff>tom-i<ffffffff>stallev"
+    "c�stom-i�stallev"
+    "custom-installe<ffffffff>"
+    
+)
+
+POST_LOGIN_RETRY_TRIGGERS=(
+    "zsh: corrupt history file"
+    "cqstom-installes"
+    "custom-installus"
+    "c<ffffffff>tom-i<ffffffff>stallev"
+    "c�stom-i�stallev"
+    "custom-installe<ffffffff>"
+)
+
+# При необходимости массивы можно переопределить через переменные окружения:
+#   ME_AUTO_TRIGGERS="login:;username:"
+#   ME_FLASH_RETRY_TRIGGERS="zsh: no matches found:;another error"
+#   ME_POST_LOGIN_RETRY_TRIGGERS="zsh: corrupt history file;another error"
 if [[ -n "${ME_AUTO_TRIGGERS:-}" ]]; then
     IFS=';' read -r -a AUTO_LOGIN_TRIGGERS <<< "$ME_AUTO_TRIGGERS"
+fi
+
+if [[ -n "${ME_FLASH_RETRY_TRIGGERS:-}" ]]; then
+    IFS=';' read -r -a FLASH_RETRY_TRIGGERS <<< "$ME_FLASH_RETRY_TRIGGERS"
+fi
+
+if [[ -n "${ME_POST_LOGIN_RETRY_TRIGGERS:-}" ]]; then
+    IFS=';' read -r -a POST_LOGIN_RETRY_TRIGGERS <<< "$ME_POST_LOGIN_RETRY_TRIGGERS"
 fi
 
 MONITOR_PIDS=()
@@ -262,6 +296,28 @@ WINDOW_GEOMETRY_MONITOR_PID=""
 # ================= ЗАГРУЗКА CONFIG =================
 shopt -s extglob nullglob
 load_config
+
+# Старые одиночные параметры CFG сохраняются для совместимости.
+# Если пользователь раньше менял FLASH_RETRY_TRIGGER или
+# POST_LOGIN_RETRY_TRIGGER в ~/.meshka.cfg, они также добавляются
+# в новые массивы (без дублей).
+if [[ -n "${FLASH_RETRY_TRIGGER:-}" ]]; then
+    _trigger_found=0
+    for _trigger in "${FLASH_RETRY_TRIGGERS[@]}"; do
+        [[ "$_trigger" == "$FLASH_RETRY_TRIGGER" ]] && _trigger_found=1 && break
+    done
+    (( _trigger_found == 0 )) && FLASH_RETRY_TRIGGERS+=("$FLASH_RETRY_TRIGGER")
+fi
+
+if [[ -n "${POST_LOGIN_RETRY_TRIGGER:-}" ]]; then
+    _trigger_found=0
+    for _trigger in "${POST_LOGIN_RETRY_TRIGGERS[@]}"; do
+        [[ "$_trigger" == "$POST_LOGIN_RETRY_TRIGGER" ]] && _trigger_found=1 && break
+    done
+    (( _trigger_found == 0 )) && POST_LOGIN_RETRY_TRIGGERS+=("$POST_LOGIN_RETRY_TRIGGER")
+fi
+
+unset _trigger_found _trigger
 
 # Переменная окружения всегда имеет приоритет над cfg.
 if [[ -n "${AUTO_LOGIN_ENABLED_ENV:-}" ]]; then
@@ -898,27 +954,27 @@ run_mode_action() {
 
     case "$MODE" in
         flash)
-            sleep 0.5
+            sleep 2
             send_uart "$PORT" "$INST"
             ;;
         check)
-            sleep 0.5
+            sleep 1
             send_uart "$PORT" "t"
             sleep 1
             send_uart "$PORT" "1"
             ;;
         check_SD)
-            sleep 0.5
+            sleep 2
             send_uart "$PORT" "dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=2000 status=progress oflag=direct"
             ;;
         RFM)
-            sleep 0.5
+            sleep 1
             send_uart "$PORT" "t"
             sleep 1
             send_uart "$PORT" "12"
             ;;
         CPU)
-            sleep 0.5
+            sleep 1
             send_uart "$PORT" "p"
             ;;
         *)
@@ -1031,59 +1087,65 @@ monitor_capture_file() {
         # Повторяем именно PASSWORD -> MODE, без повторной отправки LOGIN.
         # --------------------------------------------------------------
         if [[ "$POST_LOGIN_RETRY_ENABLED" == "1" ]]; then
-            local post_login_trigger="${POST_LOGIN_RETRY_TRIGGER,,}"
+            for trigger in "${POST_LOGIN_RETRY_TRIGGERS[@]}"; do
+                trigger="${trigger,,}"
+                [[ -z "$trigger" ]] && continue
 
-            if [[ -n "$post_login_trigger" && "$lower" == *"$post_login_trigger"* ]]; then
-                now=$(date +%s)
+                if [[ "$lower" == *"$trigger"* ]]; then
+                    now=$(date +%s)
 
-                if (( now - last_post_login_retry_time >= POST_LOGIN_RETRY_COOLDOWN )); then
-                    if (( post_login_retry_count < POST_LOGIN_RETRY_MAX )); then
-                        post_login_retry_count=$((post_login_retry_count + 1))
-                        if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
-                            uart_state_transition "$LABEL" "WAITING_SHELL" "history corruption detected"
-                            uart_state_post_login_retry "$PORT" "$LABEL" "$post_login_retry_count" || true
+                    if (( now - last_post_login_retry_time >= POST_LOGIN_RETRY_COOLDOWN )); then
+                        if (( post_login_retry_count < POST_LOGIN_RETRY_MAX )); then
+                            post_login_retry_count=$((post_login_retry_count + 1))
+                            if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
+                                uart_state_transition "$LABEL" "WAITING_SHELL" "post-login trigger: $trigger"
+                                uart_state_post_login_retry "$PORT" "$LABEL" "$post_login_retry_count" || true
+                            else
+                                retry_post_login_sequence "$PORT" || true
+                            fi
                         else
-                            retry_post_login_sequence "$PORT" || true
+                            UART_STATE="ERROR"
+                            uart_state_transition "$LABEL" "ERROR" "POST_LOGIN_RETRY_MAX reached"
                         fi
-                    else
-                        UART_STATE="ERROR"
-                        uart_state_transition "$LABEL" "ERROR" "POST_LOGIN_RETRY_MAX reached"
+                        last_post_login_retry_time=$now
                     fi
-                    last_post_login_retry_time=$now
-                fi
 
-                BUFFER=""
-                continue
-            fi
+                    BUFFER=""
+                    continue 2
+                fi
+            done
         fi
 
         # --------------------------------------------------------------
         # FLASH RETRY
         # --------------------------------------------------------------
         if [[ "$MODE" == "flash" && "$FLASH_RETRY_ENABLED" == "1" ]]; then
-            local retry_trigger="${FLASH_RETRY_TRIGGER,,}"
+            for trigger in "${FLASH_RETRY_TRIGGERS[@]}"; do
+                trigger="${trigger,,}"
+                [[ -z "$trigger" ]] && continue
 
-            if [[ -n "$retry_trigger" && "$lower" == *"$retry_trigger"* ]]; then
-                now=$(date +%s)
+                if [[ "$lower" == *"$trigger"* ]]; then
+                    now=$(date +%s)
 
-                if (( now - last_flash_retry_time >= FLASH_RETRY_COOLDOWN )); then
-                    if (( flash_retry_count < FLASH_RETRY_MAX )); then
-                        flash_retry_count=$((flash_retry_count + 1))
-                        if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
-                            uart_state_flash_retry "$PORT" "$LABEL" "$flash_retry_count" || true
+                    if (( now - last_flash_retry_time >= FLASH_RETRY_COOLDOWN )); then
+                        if (( flash_retry_count < FLASH_RETRY_MAX )); then
+                            flash_retry_count=$((flash_retry_count + 1))
+                            if [[ "$STATE_MACHINE_ENABLED" == "1" ]]; then
+                                uart_state_flash_retry "$PORT" "$LABEL" "$flash_retry_count" || true
+                            else
+                                send_uart "$PORT" "$INST" || true
+                            fi
                         else
-                            send_uart "$PORT" "$INST" || true
+                            UART_STATE="ERROR"
+                            uart_state_transition "$LABEL" "ERROR" "FLASH_RETRY_MAX reached"
                         fi
-                    else
-                        UART_STATE="ERROR"
-                        uart_state_transition "$LABEL" "ERROR" "FLASH_RETRY_MAX reached"
+                        last_flash_retry_time=$now
                     fi
-                    last_flash_retry_time=$now
-                fi
 
-                BUFFER=""
-                continue
-            fi
+                    BUFFER=""
+                    continue 2
+                fi
+            done
         fi
 
         # --------------------------------------------------------------
@@ -1573,7 +1635,7 @@ show_help() {
     echo "  q      - Запуск ARlink"
     echo "  e      - ENTER"
     echo "  c      - отправка c на устройство"
-    echo "  w      - смена режима (Прошивка/Проверка/SD/RFM)"
+    echo "  w      - смена режима (Прошивка/Проверка/SD/RFM/CPU)"
     echo "  n      - автологин с запуском стресс теста на 2 минуты"
     echo "  0      - меню выбора стиля UI"
     echo "  h      - эта справка"
