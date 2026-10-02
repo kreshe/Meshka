@@ -6,6 +6,19 @@ set -Eeuo pipefail
 APP_VERSION="2.8"
 APP_PATH="/usr/bin/me"
 
+# ================= GITHUB UPDATE =================
+# Репозиторий и параметры проверки сохраняются в ~/.meshka.cfg.
+# Формат GITHUB_REPO: OWNER/REPOSITORY.
+# Файл программы в репозитории по умолчанию должен называться "me".
+# Пример строки в ~/.meshka.cfg:
+#   GITHUB_REPO=myuser/meshka
+GITHUB_REPO="${GITHUB_REPO:-kreshe/Meshka}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
+GITHUB_SCRIPT_PATH="${GITHUB_SCRIPT_PATH:-me}"
+GITHUB_UPDATE_ENABLED="${GITHUB_UPDATE_ENABLED:-1}"
+GITHUB_UPDATE_TIMEOUT="${GITHUB_UPDATE_TIMEOUT:-8}"
+
+
 # ЕДИНЫЙ конфигурационный файл MESHKA.
 # В нём хранятся:
 #   MODE
@@ -163,6 +176,21 @@ load_config() {
             AUTO_LOGIN_VERBOSE)
                 [[ "$value" == 0 || "$value" == 1 ]] && AUTO_LOGIN_VERBOSE="$value"
                 ;;
+            GITHUB_REPO)
+                GITHUB_REPO="$value"
+                ;;
+            GITHUB_BRANCH)
+                [[ -n "$value" ]] && GITHUB_BRANCH="$value"
+                ;;
+            GITHUB_SCRIPT_PATH)
+                [[ -n "$value" ]] && GITHUB_SCRIPT_PATH="$value"
+                ;;
+            GITHUB_UPDATE_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] && GITHUB_UPDATE_ENABLED="$value"
+                ;;
+            GITHUB_UPDATE_TIMEOUT)
+                [[ "$value" =~ ^[0-9]+$ ]] && GITHUB_UPDATE_TIMEOUT="$value"
+                ;;
             WINDOW_*)
                 label="${key#WINDOW_}"
                 read -r a b c d <<< "$value"
@@ -213,6 +241,11 @@ save_config() {
         printf 'STATE_MACHINE_VERBOSE=%s\n' "$STATE_MACHINE_VERBOSE"
         printf 'AUTO_LOGIN_LOG_DIR=%s\n' "$AUTO_LOGIN_LOG_DIR"
         printf 'AUTO_LOGIN_VERBOSE=%s\n' "$AUTO_LOGIN_VERBOSE"
+        printf 'GITHUB_REPO=%s\n' "$GITHUB_REPO"
+        printf 'GITHUB_BRANCH=%s\n' "$GITHUB_BRANCH"
+        printf 'GITHUB_SCRIPT_PATH=%s\n' "$GITHUB_SCRIPT_PATH"
+        printf 'GITHUB_UPDATE_ENABLED=%s\n' "$GITHUB_UPDATE_ENABLED"
+        printf 'GITHUB_UPDATE_TIMEOUT=%s\n' "$GITHUB_UPDATE_TIMEOUT"
 
         printf '# UART WINDOWS\n'
         if ((${#WINDOW_X[@]} > 0)); then
@@ -252,9 +285,6 @@ AUTO_LOGIN_TRIGGERS=(
     "IPvgin:"
 )
 
-# Отдельные массивы триггеров для State Machine.
-# Каждый элемент проверяется как подстрока, поэтому после триггера
-# могут находиться дополнительные символы/текст.
 FLASH_RETRY_TRIGGERS=(
     "zsh: no matches found:"
     "cqstom-installes"
@@ -574,7 +604,7 @@ INPUT_HISTORY=()
 declare -A PORT_OLD_STATUS
 
 # ================= ЗАВИСИМОСТИ =================
-dependencies=(stty tr head minicom lsof tail xdotool flock sort sed)
+dependencies=(stty tr head minicom lsof tail xdotool flock sort sed curl)
 
 install_pkg() {
     local pkg="$1"
@@ -622,6 +652,117 @@ install_dbus_x11() {
         echo "❌ Не удалось установить dbus-x11 автоматически"
         return 1
     fi
+}
+
+# ================= GITHUB UPDATE ENGINE =================
+github_version_is_newer() {
+    local local_ver="$1"
+    local remote_ver="$2"
+    local newest
+
+    [[ "$local_ver" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+    [[ "$remote_ver" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+
+    newest=$(printf '%s\n%s\n' "$local_ver" "$remote_ver" | sort -V | tail -n 1)
+    [[ "$newest" == "$remote_ver" && "$remote_ver" != "$local_ver" ]]
+}
+
+check_github_update() {
+    [[ "${GITHUB_UPDATE_ENABLED:-1}" == "1" ]] || return 0
+
+    if [[ -z "${GITHUB_REPO:-}" ]]; then
+        return 0
+    fi
+
+    command -v curl >/dev/null 2>&1 || return 0
+
+    local update_url
+    local tmp
+    local remote_version
+    local answer
+    local backup
+
+    update_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${GITHUB_SCRIPT_PATH}"
+    tmp=$(mktemp "/tmp/meshka-update.XXXXXX")
+
+    echo
+    echo "🔎 Проверка обновлений MESHKA..."
+
+    if ! curl -fsSL --connect-timeout 3 --max-time "$GITHUB_UPDATE_TIMEOUT" \
+        -H "Cache-Control: no-cache" \
+        "$update_url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo "ℹ GitHub недоступен — проверка обновления пропущена."
+        return 0
+    fi
+
+    remote_version=$(sed -n 's/^[[:space:]]*APP_VERSION="\([^"[:space:]]*\)"[[:space:]]*$/\1/p' "$tmp" | head -n 1)
+
+    if [[ -z "$remote_version" || ! "$remote_version" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+        rm -f "$tmp"
+        echo "⚠ Не удалось определить версию GitHub-файла."
+        return 0
+    fi
+
+    if ! github_version_is_newer "$APP_VERSION" "$remote_version"; then
+        rm -f "$tmp"
+        echo "✔ MESHKA V$APP_VERSION — актуальная версия."
+        return 0
+    fi
+
+    echo "📦 Найдено обновление: V$APP_VERSION → V$remote_version"
+    echo "🌐 $update_url"
+    echo
+    read -r -p "Установить обновление? [y/N]: " answer
+
+    case "${answer,,}" in
+        y|yes|д|да)
+            ;;
+        *)
+            rm -f "$tmp"
+            echo "⏭ Обновление пропущено."
+            return 0
+            ;;
+    esac
+
+    # Проверяем синтаксис до замены рабочего файла.
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        echo "❌ GitHub-файл не прошёл проверку bash -n. Обновление отменено."
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo "❌ Загруженный файл пустой. Обновление отменено."
+        return 1
+    fi
+
+    backup="${APP_PATH}.backup.${APP_VERSION}.$(date +%Y%m%d-%H%M%S)"
+
+    echo "💾 Создаю резервную копию: $backup"
+    if ! sudo cp -f "$APP_PATH" "$backup"; then
+        rm -f "$tmp"
+        echo "❌ Не удалось создать резервную копию $APP_PATH"
+        return 1
+    fi
+
+    echo "⬇️ Устанавливаю MESHKA V$remote_version..."
+    if ! sudo install -m 755 "$tmp" "$APP_PATH"; then
+        rm -f "$tmp"
+        echo "❌ Не удалось установить новую версию."
+        echo "🔙 Резервная копия: $backup"
+        return 1
+    fi
+
+    rm -f "$tmp"
+
+    echo "✅ MESHKA обновлена до V$remote_version"
+    echo "🔄 Перезапуск программы..."
+    sleep 1
+
+    # Запускаем уже установленную версию с теми же аргументами.
+    exec "$APP_PATH" "$@"
 }
 
 # ================= ЦВЕТА =================
@@ -954,7 +1095,7 @@ run_mode_action() {
 
     case "$MODE" in
         flash)
-            sleep 2
+            sleep 1
             send_uart "$PORT" "$INST"
             ;;
         check)
@@ -964,7 +1105,7 @@ run_mode_action() {
             send_uart "$PORT" "1"
             ;;
         check_SD)
-            sleep 2
+            sleep 1
             send_uart "$PORT" "dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=2000 status=progress oflag=direct"
             ;;
         RFM)
@@ -1177,7 +1318,6 @@ monitor_capture_file() {
         done
     done < <(tail -Fn 0 "$LOGFILE" 2>/dev/null || true)
 }
-
 
 start_uart_monitors() {
     [[ "$AUTO_LOGIN_ENABLED" == "1" ]] || return 0
@@ -1635,7 +1775,7 @@ show_help() {
     echo "  q      - Запуск ARlink"
     echo "  e      - ENTER"
     echo "  c      - отправка c на устройство"
-    echo "  w      - смена режима (Прошивка/Проверка/SD/RFM/CPU)"
+    echo "  w      - смена режима (Прошивка/Проверка/SD/RFM)"
     echo "  n      - автологин с запуском стресс теста на 2 минуты"
     echo "  0      - меню выбора стиля UI"
     echo "  h      - эта справка"
@@ -1733,6 +1873,10 @@ else
     echo "✈️   Запускаем прогрев турбин"
 fi
 
+# Проверяем GitHub до открытия UART-окон, чтобы обновление не вмешивалось
+# в уже запущенные minicom/monitor процессы.
+check_github_update "$@"
+
 change_mode() {
     clear
     echo "========================"
@@ -1785,6 +1929,10 @@ change_mode() {
 }
 
 # ================= MAIN =================
+# Проверяем GitHub ДО запуска minicom и UI, чтобы запрос обновления
+# гарантированно был виден в текущем терминале.
+check_github_update || true
+
 ensure_window_defaults
 save_config
 
